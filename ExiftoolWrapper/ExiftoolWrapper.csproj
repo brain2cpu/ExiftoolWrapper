@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <RootNamespace>Brain2CPU.ExifTool</RootNamespace>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>Brain2CPU.ExifTool.snk</AssemblyOriginatorKeyFile>
+    <DelaySign>false</DelaySign>
+    <Version>4.0.0</Version>
+    <Authors>Béla Bokor</Authors>
+    <Company>Brain2CPU</Company>
+    <Description>A .NET dll wrapper over exiftool</Description>
+    <Copyright>Copyright © 2013 - 2018 Béla Bokor</Copyright>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageProjectUrl>http://brain2cpu.com/devtools.html</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/brain2cpu/ExiftoolWrapper.git</RepositoryUrl>
+    <PackageTags>exif exiftool C#</PackageTags>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Remove="ExifToolWrapper.cs~RF158fe6ba.TMP" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Readme.txt">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
