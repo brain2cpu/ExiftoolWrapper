@@ -211,7 +211,9 @@ namespace Brain2CPU.ExifTool
                     {
                         _proc.Kill();
                         _proc.WaitForExit((int)(1000 * SecondsToWaitForStop / 2));
-                        _proc.Dispose();
+
+                        // after WaitForExit proc turns null
+                        _proc?.Dispose();
                     }
                     catch(Exception xcp)
                     {
@@ -343,7 +345,7 @@ namespace Brain2CPU.ExifTool
             foreach(string s in cmdRes.Result.Split(new [] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
             {
                 string[] kv = s.Split('\t');
-                Debug.Assert(kv.Length == 2, $"Can not parse line :'{s}'");
+                //Debug.Assert(kv.Length == 2, $"Can not parse line :'{s}'");
 
                 if(kv.Length != 2 || (!keepKeysWithEmptyValues && string.IsNullOrEmpty(kv[1])))
                     continue;
