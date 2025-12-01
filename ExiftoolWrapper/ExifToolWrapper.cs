@@ -3,10 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading;
-using System.Linq;
 
 namespace Brain2CPU.ExifTool
 {
@@ -37,8 +37,8 @@ namespace Brain2CPU.ExifTool
         public string ExifToolVersion { get; private set; }
 
         private  const string ExeName         = "exiftool(-k).exe";
-        private  const string Arguments       = "-fast  -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t";   //-g for groups
-        private  const string ArgumentsFaster = "-fast2 -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t";
+        private  const string Arguments       = "-fast  -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";   //-g for groups
+        private  const string ArgumentsFaster = "-fast2 -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";
         private  const string ExitMessage     = "-- press RETURN --";
         internal const string SuccessMessage  = "1 image files updated";
 
@@ -102,7 +102,9 @@ namespace Brain2CPU.ExifTool
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                RedirectStandardInput = true
+                RedirectStandardInput = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
             };
 
             Status = ExeStatus.Stopped;
@@ -231,11 +233,6 @@ namespace Brain2CPU.ExifTool
 
         private void DirectSend(string cmd, params object[] args)
         {
-            //tried some re-encoding like this, no success
-            //var ba = Encoding.Convert(Encoding.Unicode, Encoding.UTF8, Encoding.Unicode.GetBytes(cmd));
-            //string b = Encoding.UTF8.GetString(ba);
-            //proc.StandardInput.Write("-charset\nfilename=UTF8\n{0}\n-execute{1}\n", args.Length == 0 ? b : string.Format(b, args), cmdCnt);
-
             _proc.StandardInput.Write("{0}\n-execute{1}\n", args.Length == 0 ? cmd : string.Format(cmd, args), _cmdCnt);
             _waitHandle.WaitOne();
         }
@@ -246,12 +243,10 @@ namespace Brain2CPU.ExifTool
             var argFile = Path.GetTempFileName();
             try
             {
-                using(var sw = new StreamWriter(argFile))
-                {
-                    sw.WriteLine(args.Length == 0 ? cmd : string.Format(cmd, args), _cmdCnt);
-                }
+                var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+                File.WriteAllText(argFile, args.Length == 0 ? cmd : string.Format(cmd, args), utf8NoBom);
 
-                _proc.StandardInput.Write("-charset\nfilename=UTF8\n-@\n{0}\n-execute{1}\n", argFile, _cmdCnt);
+                _proc.StandardInput.Write("-@\n{0}\n-execute{1}\n", argFile, _cmdCnt);
                 _waitHandle.WaitOne();
             }
             finally
@@ -464,6 +459,35 @@ namespace Brain2CPU.ExifTool
 
         public ExifToolResponse SetOrientationDeg(string path, int ori, bool overwriteOriginal = true) =>
             SetOrientation(path, OrientationDeg2Pos(ori), overwriteOriginal);
+
+        public ExifToolResponse SetDescription(string path, string description, bool overwriteOriginal = true)
+        {
+            if (!File.Exists(path))
+                return new ExifToolResponse(false, $"'{path}' not found");
+
+            var prevMethod = Method;
+            Method = CommunicationMethod.ViaFile;
+            var res = SetExifInto(path, "XMP-dc:Description", description, overwriteOriginal);
+            //var res = SendCommand($"-XMP-dc:Description={description}\n{path}");
+            Method = prevMethod;
+
+            return res;
+        }
+
+        public string GetDescription(string path)
+        {
+            if (!File.Exists(path))
+                return null;
+
+            var cmdRes = SendCommand("-XMP-dc:Description\n-n\n-s3\n{0}", path);
+            if (!cmdRes)
+                return "";
+
+            return cmdRes.Result.Trim('\t', '\r', '\n');
+
+            //var cmdRes = FetchExifFrom(path, { "XMP-dc:Description"});
+            //return cmdRes.SingleOrDefault().Value ?? "";
+        }
 
         #region Static orientation helpers
 
