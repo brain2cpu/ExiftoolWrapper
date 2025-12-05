@@ -8,608 +8,578 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 
-namespace Brain2CPU.ExifTool
+namespace Brain2CPU.ExifTool;
+
+public sealed class ExifToolWrapper : IExifToolWrapper
 {
-    public struct ExifToolResponse
+    //-fast2 also causes exiftool to avoid extracting any EXIF MakerNote information
+    private  const string ExeName         = "exiftool(-k).exe";
+    private  const string Arguments       = "-fast  -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";   //-g for groups
+    private  const string ArgumentsFaster = "-fast2 -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";
+    private  const string ExitMessage     = "-- press RETURN --";
+    internal const string SuccessMessage  = "1 image files updated";
+
+    public double SecondsToWaitForError { get; set; } = 1;
+    public double SecondsToWaitForStop  { get; set; } = 5;
+
+    public string ExifToolPath    { get; }
+    public string ArgumentsInUse  { get; }
+    public string ExifToolVersion { get; private set; }
+    
+    public enum ExeStatus { Stopped, Starting, Ready, Stopping }
+    public ExeStatus Status { get; private set; }
+
+    //ViaFile: for every command an argument file is created, it works for files with accented characters, but it is slower
+    public enum CommunicationMethod { Auto, Direct, ViaFile }
+    public CommunicationMethod Method { get; set; } = CommunicationMethod.Auto;
+
+    public bool Resurrect { get; set; } = true;
+
+    private bool _stopRequested = false;
+
+    private int _cmdCnt = 0;
+    private readonly StringBuilder _output = new();
+    private readonly StringBuilder _error  = new();
+
+    private readonly ProcessStartInfo _psi;
+    private Process _proc = null;
+
+    private readonly ManualResetEvent _waitHandle = new(true);
+    private readonly ManualResetEvent _waitForErrorHandle = new(true);
+#if NET10_0_OR_GREATER    
+    private readonly Lock _lockObj = new();
+#else    
+    private readonly object _lockObj = new();
+#endif
+
+    public ExifToolWrapper(string path = null, bool faster = false) : this(path, faster ? ArgumentsFaster : Arguments)
     {
-        public bool IsSuccess { get; }
-        public string Result { get; }
+    }
+    
+    public ExifToolWrapper(string path, string arguments)
+    {
+        ExifToolPath = DiscoverExiftool(path);
 
-        public ExifToolResponse(string r)
+        if(string.IsNullOrEmpty(ExifToolPath))
+            throw new ExifToolException($"{ExeName} not found");
+
+        ArgumentsInUse = arguments;
+
+        _psi = new ProcessStartInfo
         {
-            IsSuccess = r.ToLowerInvariant().Contains(ExifToolWrapper.SuccessMessage);
-            Result = r;
-        }
+            FileName = ExifToolPath,
+            Arguments = arguments,
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            RedirectStandardInput = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8
+        };
 
-        public ExifToolResponse(bool b, string r)
-        {
-            IsSuccess = b;
-            Result = r;
-        }
-
-        //to use ExifToolResponse directly in if (discarding response)
-        public static implicit operator bool(ExifToolResponse r) => r.IsSuccess;
+        Status = ExeStatus.Stopped;
     }
 
-    public sealed class ExifToolWrapper : IDisposable
+    private static string DiscoverExiftool(string path)
     {
-        public string ExifToolPath    { get; }
-        public string ExifToolVersion { get; private set; }
-
-        private  const string ExeName         = "exiftool(-k).exe";
-        private  const string Arguments       = "-fast  -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";   //-g for groups
-        private  const string ArgumentsFaster = "-fast2 -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";
-        private  const string ExitMessage     = "-- press RETURN --";
-        internal const string SuccessMessage  = "1 image files updated";
-
-        //-fast2 also causes exiftool to avoid extracting any EXIF MakerNote information
-
-        public double SecondsToWaitForError { get; set; } = 1;
-        public double SecondsToWaitForStop  { get; set; } = 5;
-
-        public enum ExeStatus { Stopped, Starting, Ready, Stopping }
-        public ExeStatus Status { get; private set; }
-
-        //ViaFile: for every command an argument file is created, it works for files with accented characters but it is slower
-        public enum CommunicationMethod { Auto, Direct, ViaFile }
-        public CommunicationMethod Method { get; set; } = CommunicationMethod.Auto;
-
-        public bool Resurrect { get; set; } = true;
-
-        private bool _stopRequested = false;
-
-        private int _cmdCnt = 0;
-        private readonly StringBuilder _output = new StringBuilder();
-        private readonly StringBuilder _error  = new StringBuilder();
-
-        private readonly ProcessStartInfo _psi;
-        private Process _proc = null;
-
-        private readonly ManualResetEvent _waitHandle = new ManualResetEvent(true);
-        private readonly ManualResetEvent _waitForErrorHandle = new ManualResetEvent(true);
-
-        public ExifToolWrapper(string path = null, bool faster = false)
+        if(string.IsNullOrEmpty(path))
         {
-            if(string.IsNullOrEmpty(path))
+            if (File.Exists(ExeName)) //in current directory
+                return Path.GetFullPath(ExeName);
+            
+            try
             {
-                if(File.Exists(ExeName)) //in current directory
-                    ExifToolPath = Path.GetFullPath(ExeName);
-                else
-                {
-                    try
-                    {
-                        string dir = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location);
-                        ExifToolPath = Path.Combine(dir, ExeName);
-                    }
-                    catch(Exception xcp)
-                    {
-                        Debug.WriteLine(xcp.ToString());
-                        ExifToolPath = ExeName;
-                    }
-                }
+                var dir = Path.GetDirectoryName(Assembly.GetEntryAssembly().Location);
+                var exe = Path.Combine(dir, ExeName);
+                if (File.Exists(exe))
+                    return exe;
             }
-            else
-                ExifToolPath = path;
-
-            if(!File.Exists(ExifToolPath))
-                throw new ExifToolException($"{ExeName} not found");
-
-            _psi = new ProcessStartInfo
+            catch(Exception xcp)
             {
-                FileName = ExifToolPath,
-                Arguments = faster ? ArgumentsFaster : Arguments,
-                CreateNoWindow = true,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                RedirectStandardInput = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8
-            };
-
-            Status = ExeStatus.Stopped;
+                Debug.WriteLine(xcp.ToString());
+            }
+            
+            return "";
         }
 
-        private void OutputDataReceived(object sender, DataReceivedEventArgs e)
+        if (File.Exists(path))
+            return path;
+
+        if (Directory.Exists(path))
         {
-            if(string.IsNullOrEmpty(e?.Data))
-                return;
-
-            if(Status == ExeStatus.Starting)
-            {
-                ExifToolVersion = e.Data;
-                _waitHandle.Set();
-
-                return;
-            }
-
-            if(string.Equals(e.Data, $"{{ready{_cmdCnt}}}", StringComparison.OrdinalIgnoreCase))
-            {
-                _waitHandle.Set();
-
-                return;
-            }
-
-            _output.AppendLine(e.Data);
+            var exe = Path.Combine(path, ExeName);
+            if (File.Exists(exe))
+                return exe;
         }
 
-        //the error message has no 'ready' or other terminator so we must assume it has a single line (or it is received fast enough)
-        private void ErrorDataReceived(object sender, DataReceivedEventArgs e)
+        return "";
+    }
+    
+    public void Start()
+    {
+        _stopRequested = false;
+
+        if(Status != ExeStatus.Stopped)
+            throw new ExifToolException("Process is not stopped");
+
+        Status = ExeStatus.Starting;
+
+        _proc = new Process { StartInfo = _psi, EnableRaisingEvents = true };
+        _proc.OutputDataReceived += OutputDataReceived;
+        _proc.ErrorDataReceived += ErrorDataReceived;
+        _proc.Exited += ProcExited;
+        _proc.Start();
+
+        _proc.BeginOutputReadLine();
+        _proc.BeginErrorReadLine();
+        _proc.StandardInput.AutoFlush = true;
+
+        _waitHandle.Reset();
+        _proc.StandardInput.Write("-ver\n-execute0000\n");
+        _waitHandle.WaitOne();
+
+        Status = ExeStatus.Ready;
+    }
+
+    private void OutputDataReceived(object sender, DataReceivedEventArgs e)
+    {
+        if(string.IsNullOrEmpty(e?.Data))
+            return;
+
+        if(Status == ExeStatus.Starting)
         {
-            if(string.IsNullOrEmpty(e?.Data))
-                return;
+            ExifToolVersion = e.Data;
+            _waitHandle.Set();
 
-            if(string.Equals(e.Data, ExitMessage, StringComparison.OrdinalIgnoreCase))
-            {
-                _proc?.StandardInput.WriteLine();
-
-                return;
-            }
-
-            _error.AppendLine(e.Data);
-            _waitForErrorHandle.Set();
+            return;
         }
 
-        public void Start()
+        if(string.Equals(e.Data, $"{{ready{_cmdCnt}}}", StringComparison.OrdinalIgnoreCase))
         {
-            _stopRequested = false;
+            _waitHandle.Set();
 
-            if(Status != ExeStatus.Stopped)
-                throw new ExifToolException("Process is not stopped");
-
-            Status = ExeStatus.Starting;
-
-            _proc = new Process { StartInfo = _psi, EnableRaisingEvents = true };
-            _proc.OutputDataReceived += OutputDataReceived;
-            _proc.ErrorDataReceived += ErrorDataReceived;
-            _proc.Exited += ProcExited;
-            _proc.Start();
-
-            _proc.BeginOutputReadLine();
-            _proc.BeginErrorReadLine();
-            _proc.StandardInput.AutoFlush = true;
-
-            _waitHandle.Reset();
-            _proc.StandardInput.Write("-ver\n-execute0000\n");
-            _waitHandle.WaitOne();
-
-            Status = ExeStatus.Ready;
+            return;
         }
 
-        //detect if process was killed
-        private void ProcExited(object sender, EventArgs e)
+        _output.AppendLine(e.Data);
+    }
+
+    //the error message has no 'ready' or other terminator so we must assume it has a single line (or it is received fast enough)
+    private void ErrorDataReceived(object sender, DataReceivedEventArgs e)
+    {
+        if(string.IsNullOrEmpty(e?.Data))
+            return;
+
+        if(string.Equals(e.Data, ExitMessage, StringComparison.OrdinalIgnoreCase))
+        {
+            _proc?.StandardInput.WriteLine();
+
+            return;
+        }
+
+        _error.AppendLine(e.Data);
+        _waitForErrorHandle.Set();
+    }
+
+    //detect if process was killed
+    private void ProcExited(object sender, EventArgs e)
+    {
+        if(_proc != null)
+        {
+            _proc.Dispose();
+            _proc = null;
+        }
+
+        Status = ExeStatus.Stopped;
+
+        _waitHandle.Set();
+
+        if(!_stopRequested && Resurrect)
+            Start();
+    }
+
+    public void Stop()
+    {
+        _stopRequested = true;
+
+        if(Status != ExeStatus.Ready)
+            throw new ExifToolException("Process must be ready");
+
+        Status = ExeStatus.Stopping;
+
+        _waitHandle.Reset();
+        _proc.StandardInput.Write("-stay_open\nFalse\n");
+            
+        if(!_waitHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForStop)))
         {
             if(_proc != null)
             {
-                _proc.Dispose();
+                try
+                {
+                    _proc.Kill();
+                    _proc.WaitForExit((int)(1000 * SecondsToWaitForStop / 2));
+
+                    // after WaitForExit proc turns null
+                    _proc?.Dispose();
+                }
+                catch(Exception xcp)
+                {
+                    Debug.WriteLine(xcp.ToString());
+                }
+
                 _proc = null;
             }
 
             Status = ExeStatus.Stopped;
-
-            _waitHandle.Set();
-
-            if(!_stopRequested && Resurrect)
-                Start();
         }
+    }
 
-        public void Stop()
+    private void DirectSend(string cmd, params object[] args)
+    {
+        _proc.StandardInput.Write("{0}\n-execute{1}\n", args.Length == 0 ? cmd : string.Format(cmd, args), _cmdCnt);
+        _waitHandle.WaitOne();
+    }
+        
+    //http://u88.n24.queensu.ca/exiftool/forum/index.php?topic=8382.0
+    private void SendViaFile(string cmd, params object[] args)
+    {
+        var argFile = Path.GetTempFileName();
+        try
         {
-            _stopRequested = true;
+            var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+            File.WriteAllText(argFile, args.Length == 0 ? cmd : string.Format(cmd, args), utf8NoBom);
 
-            if(Status != ExeStatus.Ready)
-                throw new ExifToolException("Process must be ready");
-
-            Status = ExeStatus.Stopping;
-
-            _waitHandle.Reset();
-            _proc.StandardInput.Write("-stay_open\nFalse\n");
-            
-            if(!_waitHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForStop)))
-            {
-                if(_proc != null)
-                {
-                    try
-                    {
-                        _proc.Kill();
-                        _proc.WaitForExit((int)(1000 * SecondsToWaitForStop / 2));
-
-                        // after WaitForExit proc turns null
-                        _proc?.Dispose();
-                    }
-                    catch(Exception xcp)
-                    {
-                        Debug.WriteLine(xcp.ToString());
-                    }
-
-                    _proc = null;
-                }
-
-                Status = ExeStatus.Stopped;
-            }
-        }
-
-        private readonly object _lockObj = new object();
-
-        private void DirectSend(string cmd, params object[] args)
-        {
-            _proc.StandardInput.Write("{0}\n-execute{1}\n", args.Length == 0 ? cmd : string.Format(cmd, args), _cmdCnt);
+            _proc.StandardInput.Write("-@\n{0}\n-execute{1}\n", argFile, _cmdCnt);
             _waitHandle.WaitOne();
         }
-        
-        //http://u88.n24.queensu.ca/exiftool/forum/index.php?topic=8382.0
-        private void SendViaFile(string cmd, params object[] args)
+        finally
         {
-            var argFile = Path.GetTempFileName();
-            try
-            {
-                var utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-                File.WriteAllText(argFile, args.Length == 0 ? cmd : string.Format(cmd, args), utf8NoBom);
-
-                _proc.StandardInput.Write("-@\n{0}\n-execute{1}\n", argFile, _cmdCnt);
-                _waitHandle.WaitOne();
-            }
-            finally
-            {
-                File.Delete(argFile);
-            }
+            File.Delete(argFile);
         }
+    }
 
-        public ExifToolResponse SendCommand(string cmd, params object[] args) => SendCommand(Method, cmd, args);
+    public ExifToolResponse SendCommand(string cmd, params object[] args) => SendCommand(Method, cmd, args);
         
-        private ExifToolResponse SendCommand(CommunicationMethod method, string cmd, params object[] args)
+    private ExifToolResponse SendCommand(CommunicationMethod method, string cmd, params object[] args)
+    {
+        if(Status != ExeStatus.Ready)
+            throw new ExifToolException("Process must be ready");
+
+        ExifToolResponse resp;
+        lock(_lockObj)
         {
-            if(Status != ExeStatus.Ready)
-                throw new ExifToolException("Process must be ready");
+            _waitHandle.Reset();
+            _waitForErrorHandle.Reset();
 
-            ExifToolResponse resp;
-            lock(_lockObj)
+            if(method == CommunicationMethod.ViaFile)
+                SendViaFile(cmd, args);
+            else
+                DirectSend(cmd, args);
+
+            //if no output then probably there is an error, so wait at most SecondsToWaitForError for the error message to arrive 
+            if(_output.Length == 0)
             {
-                _waitHandle.Reset();
-                _waitForErrorHandle.Reset();
-
-                if(method == CommunicationMethod.ViaFile)
-                    SendViaFile(cmd, args);
+                _waitForErrorHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForError));
+                resp = new ExifToolResponse(false, _error.ToString());
+                _error.Clear();
+            }
+            else
+            {
+                string result;
+                var error = _error.ToString();
+                if (string.IsNullOrWhiteSpace(error))
+                    result = _output.ToString();
                 else
-                    DirectSend(cmd, args);
-
-                //if no output then probably there is an error, so wait at most SecondsToWaitForError for the error message to arrive 
-                if(_output.Length == 0)
                 {
-                    _waitForErrorHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForError));
-                    resp = new ExifToolResponse(false, _error.ToString());
+                    result = $"{_output} ({error.Trim()})";
                     _error.Clear();
                 }
-                else
-                {
-                    resp = new ExifToolResponse(true, _output.ToString());
-                    _output.Clear();
-                }
 
-                _cmdCnt++;
+                resp = new ExifToolResponse(true, result);
+                _output.Clear();
             }
 
-            if(!resp.IsSuccess && method == CommunicationMethod.Auto)
-            {
-                string err = resp.Result.ToLowerInvariant();
-
-                if(err.Contains("file not found") || err.Contains("invalid filename encoding"))
-                     return SendCommand(CommunicationMethod.ViaFile, cmd, args);
-            }
-
-            return resp;
+            _cmdCnt++;
         }
 
-        public ExifToolResponse SetExifInto(string path, string key, string val, bool overwriteOriginal = true) =>
-            SetExifInto(path, new Dictionary<string, string> {[key] = val}, overwriteOriginal);
-
-        public ExifToolResponse SetExifInto(string path, Dictionary<string, string> data, bool overwriteOriginal = true)
+        if(!resp.IsSuccess && method == CommunicationMethod.Auto)
         {
-            if(!File.Exists(path))
-                return new ExifToolResponse(false, $"'{path}' not found");
+            var err = resp.Result.ToLowerInvariant();
 
-            var cmd = new StringBuilder();
-            foreach(KeyValuePair<string, string> kv in data)
-            {
-                cmd.AppendFormat("-{0}={1}\n", kv.Key, kv.Value);
-            }
-            
-            if(overwriteOriginal)
-                cmd.Append("-overwrite_original\n");
-            
-            cmd.Append(path);
-            var cmdRes = SendCommand(cmd.ToString());
-
-            //if failed return as it is, if it's success must check the response
-            return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
+            if(err.Contains("file not found") || err.Contains("invalid filename encoding"))
+                return SendCommand(CommunicationMethod.ViaFile, cmd, args);
         }
 
-        public Dictionary<string, string> FetchExifFrom(string path, IEnumerable<string> tagsToKeep = null, bool keepKeysWithEmptyValues = true)
+        return resp;
+    }
+
+    public ExifToolResponse SetExifInto(string path, string key, string val, bool overwriteOriginal = true) =>
+        SetExifInto(path, new Dictionary<string, string> {[key] = val}, overwriteOriginal);
+
+    public ExifToolResponse SetExifInto(string path, Dictionary<string, string> data, bool overwriteOriginal = true)
+    {
+        if(!File.Exists(path))
+            return new ExifToolResponse(false, $"'{path}' not found");
+
+        var cmd = new StringBuilder();
+        foreach(var kv in data)
         {
-            var res = new Dictionary<string, string>();
+            cmd.AppendFormat("-{0}={1}\n", kv.Key, kv.Value);
+        }
+            
+        if(overwriteOriginal)
+            cmd.Append("-overwrite_original\n");
+            
+        cmd.Append(path);
+        var cmdRes = SendCommand(cmd.ToString());
 
-            if(!File.Exists(path))
-                return res;
+        //if failed return as it is, if it's success must check the response
+        return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
+    }
 
-            var tagsTable = tagsToKeep?.ToDictionary(x => x, x => 1);
-            bool filter = tagsTable != null && tagsTable.Count > 0;
-            var cmdRes = SendCommand(path);
-            if(!cmdRes)
-                return res;
+    public Dictionary<string, string> FetchExifFrom(string path, IEnumerable<string> tagsToKeep = null, bool keepKeysWithEmptyValues = true)
+#if NETSTANDARD2_0
+        => FetchExif(path, tagsToKeep, keepKeysWithEmptyValues).GroupBy(x => x.key).ToDictionary(g => g.Key, g => g.First().value);
+#else
+        => FetchExif(path, tagsToKeep, keepKeysWithEmptyValues).DistinctBy(x => x.key).ToDictionary(x => x.key, x => x.value);
+#endif
 
-            foreach(string s in cmdRes.Result.Split(new [] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string[] kv = s.Split('\t');
-                //Debug.Assert(kv.Length == 2, $"Can not parse line :'{s}'");
+    public List<string> FetchExifToListFrom(string path, IEnumerable<string> tagsToKeep = null, bool keepKeysWithEmptyValues = true, string separator = ": ")
+        => FetchExif(path, tagsToKeep, keepKeysWithEmptyValues).Select(x => $"{x.key}{separator}{x.value}").ToList();
+    
+    private IEnumerable<(string key, string value)> FetchExif(string path, IEnumerable<string> tagsToKeep, bool keepKeysWithEmptyValues)
+    {
+        if(!File.Exists(path))
+            yield break;
 
-                if(kv.Length != 2 || (!keepKeysWithEmptyValues && string.IsNullOrEmpty(kv[1])))
-                    continue;
+#if NETSTANDARD2_0        
+        var tagsTable = tagsToKeep == null ? null : new HashSet<string>(tagsToKeep);
+#else        
+        var tagsTable = tagsToKeep?.ToHashSet();
+#endif
+        
+        var cmdRes = SendCommand(path);
+        if(!cmdRes)
+            yield break;
 
-                if(filter && !tagsTable.ContainsKey(kv[0]))
-                    continue;
+        char[] splitAt = ['\t'];
+        foreach(var s in cmdRes.Result.Split([Environment.NewLine], StringSplitOptions.RemoveEmptyEntries))
+        {
+            var kv = s.Split(splitAt);
+            Debug.Assert(kv.Length == 2, $"Can not parse line :'{s}'");
+
+            if(kv.Length != 2 || (!keepKeysWithEmptyValues && string.IsNullOrEmpty(kv[1])))
+                continue;
+
+            if(tagsTable is not null && !tagsTable.Contains(kv[0]))
+                continue;
                     
-                res[kv[0]] = kv[1];
-            }
-
-            return res;
+            yield return (kv[0], kv[1]);
         }
+    }
 
-        public List<string> FetchExifToListFrom(string path, IEnumerable<string> tagsToKeep = null, bool keepKeysWithEmptyValues = true, string separator = ": ")
-        {
-            var res = new List<string>();
+    public ExifToolResponse CloneExif(string source, string dest, bool backup = false)
+    {
+        if(!File.Exists(source) || !File.Exists(dest))
+            return new ExifToolResponse(false, $"'{source}' or '{dest}' not found");
 
-            if(!File.Exists(path))
-                return res;
+        var cmdRes = SendCommand("{0}-tagsFromFile\n{1}\n{2}", backup ? "" : "-overwrite_original\n", source, dest);
 
-            var tagsTable = tagsToKeep?.ToDictionary(x => x, x => 1);
-            bool filter = tagsTable?.Count > 0;
-            var cmdRes = SendCommand(path);
-            if(!cmdRes)
-                return res;
+        return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
+    }
 
-            foreach(string s in cmdRes.Result.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                string[] kv = s.Split('\t');
-                Debug.Assert(kv.Length == 2, $"Can not parse line :'{s}'");
+    public ExifToolResponse ClearExif(string path, bool backup = false)
+    {
+        if(!File.Exists(path))
+            return new ExifToolResponse(false, $"'{path}' not found");
 
-                if(kv.Length != 2 || (!keepKeysWithEmptyValues && string.IsNullOrEmpty(kv[1])))
-                    continue;
+        var cmdRes = SendCommand("{0}-all=\n{1}", backup ? "" : "-overwrite_original\n", path);
 
-                if(filter && !tagsTable.ContainsKey(kv[0]))
-                    continue;
+        return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
+    }
 
-                res.Add($"{kv[0]}{separator}{kv[1]}");
-            }
-
-            return res;
-        }
-
-        public ExifToolResponse CloneExif(string source, string dest, bool backup = false)
-        {
-            if(!File.Exists(source) || !File.Exists(dest))
-                return new ExifToolResponse(false, $"'{source}' or '{dest}' not found");
-
-            var cmdRes = SendCommand("{0}-tagsFromFile\n{1}\n{2}", backup ? "" : "-overwrite_original\n", source, dest);
-
-            return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
-        }
-
-        public ExifToolResponse ClearExif(string path, bool backup = false)
-        {
-            if(!File.Exists(path))
-                return new ExifToolResponse(false, $"'{path}' not found");
-
-            var cmdRes = SendCommand("{0}-all=\n{1}", backup ? "" : "-overwrite_original\n", path);
-
-            return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
-        }
-
-        public DateTime? GetCreationTime(string path)
-        {
-            if(!File.Exists(path))
-                return null;
-
-            var cmdRes = SendCommand("-DateTimeOriginal\n-s3\n{0}", path);
-            if(!cmdRes)
-                return null;
-
-            if(DateTime.TryParseExact(cmdRes.Result,
-                "yyyy.MM.dd HH:mm:ss",
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.AllowWhiteSpaces,
-                out DateTime dt))
-                return dt;
-
+    public DateTime? GetCreationTime(string path)
+    {
+        if(!File.Exists(path))
             return null;
-        }
 
-        public int GetOrientation(string path)
-        {
-            if(!File.Exists(path))
-                return 1;
+        var cmdRes = SendCommand("-DateTimeOriginal\n-s3\n{0}", path);
+        if(!cmdRes)
+            return null;
 
-            var cmdRes = SendCommand("-Orientation\n-n\n-s3\n{0}", path);
-            if(!cmdRes)
-                return 1;
+        if(DateTime.TryParseExact(cmdRes.Result,
+               "yyyy.MM.dd HH:mm:ss",
+               CultureInfo.InvariantCulture,
+               DateTimeStyles.AllowWhiteSpaces,
+               out var dt))
+            return dt;
 
-            if(int.TryParse(cmdRes.Result.Trim('\t', '\r', '\n'), out int o))
-                return o;
+        return null;
+    }
 
+    public int GetOrientation(string path)
+    {
+        if(!File.Exists(path))
             return 1;
-        }
 
-        public int GetOrientationDeg(string path) => OrientationPos2Deg(GetOrientation(path));
+        var cmdRes = SendCommand("-Orientation\n-n\n-s3\n{0}", path);
+        if(!cmdRes)
+            return 1;
 
-        public ExifToolResponse SetOrientation(string path, int ori, bool overwriteOriginal = true)
-        {
-            if(!File.Exists(path))
-                return new ExifToolResponse(false, $"'{path}' not found");
+        if(int.TryParse(cmdRes.Result.Trim('\t', '\r', '\n'), out var o))
+            return o;
 
-            var cmd = new StringBuilder();
-            cmd.AppendFormat("-Orientation={0}\n-n\n-s3\n", ori);
+        return 1;
+    }
 
-            if(overwriteOriginal)
-                cmd.Append("-overwrite_original\n");
+    public int GetOrientationDeg(string path) => OrientationPos2Deg(GetOrientation(path));
 
-            cmd.Append(path);
-            var cmdRes = SendCommand(cmd.ToString());
+    public ExifToolResponse SetOrientation(string path, int ori, bool overwriteOriginal = true)
+    {
+        if(!File.Exists(path))
+            return new ExifToolResponse(false, $"'{path}' not found");
 
-            return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
-        }
+        var cmd = new StringBuilder();
+        cmd.AppendFormat("-Orientation={0}\n-n\n-s3\n", ori);
 
-        public ExifToolResponse SetOrientationDeg(string path, int ori, bool overwriteOriginal = true) =>
-            SetOrientation(path, OrientationDeg2Pos(ori), overwriteOriginal);
+        if(overwriteOriginal)
+            cmd.Append("-overwrite_original\n");
 
-        public ExifToolResponse SetDescription(string path, string description, bool overwriteOriginal = true)
-        {
-            if (!File.Exists(path))
-                return new ExifToolResponse(false, $"'{path}' not found");
+        cmd.Append(path);
+        var cmdRes = SendCommand(cmd.ToString());
 
-            var prevMethod = Method;
-            Method = CommunicationMethod.ViaFile;
-            var res = SetExifInto(path, "XMP-dc:Description", description, overwriteOriginal);
-            //var res = SendCommand($"-XMP-dc:Description={description}\n{path}");
-            Method = prevMethod;
+        return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
+    }
 
-            return res;
-        }
+    public ExifToolResponse SetOrientationDeg(string path, int ori, bool overwriteOriginal = true) =>
+        SetOrientation(path, OrientationDeg2Pos(ori), overwriteOriginal);
 
-        public string GetDescription(string path)
-        {
-            if (!File.Exists(path))
-                return null;
+    public ExifToolResponse SetDescription(string path, string description, bool overwriteOriginal = true)
+    {
+        if (!File.Exists(path))
+            return new ExifToolResponse(false, $"'{path}' not found");
 
-            var cmdRes = SendCommand("-XMP-dc:Description\n-n\n-s3\n{0}", path);
-            if (!cmdRes)
-                return "";
+        var prevMethod = Method;
+        Method = CommunicationMethod.ViaFile;
+        var res = SetExifInto(path, "XMP-dc:Description", description, overwriteOriginal);
+        Method = prevMethod;
 
-            return cmdRes.Result.Trim('\t', '\r', '\n');
+        return res;
+    }
 
-            //var cmdRes = FetchExifFrom(path, { "XMP-dc:Description"});
-            //return cmdRes.SingleOrDefault().Value ?? "";
-        }
+    public string GetDescription(string path)
+    {
+        if (!File.Exists(path))
+            return null;
 
-        #region Static orientation helpers
+        var cmdRes = SendCommand("-XMP-dc:Description\n-n\n-s3\n{0}", path);
+        if (!cmdRes)
+            return "";
 
-        /*
-         
+        return cmdRes.Result.Trim('\t', '\r', '\n');
+
+        //var cmdRes = FetchExifFrom(path, { "XMP-dc:Description"});
+        //return cmdRes.SingleOrDefault().Value ?? "";
+    }
+
+    #region Static orientation helpers
+
+    /*
+
 1        2       3      4         5            6           7          8
 
-888888  888888      88  88      8888888888          88  8888888888   88          
-88          88      88  88      88  88          88  88      88  88   88  88      
-8888      8888    8888  8888    88          8888888888          88   8888888888  
+888888  888888      88  88      8888888888          88  8888888888   88
+88          88      88  88      88  88          88  88      88  88   88  88
+8888      8888    8888  8888    88          8888888888          88   8888888888
 88          88      88  88
 88          88  888888  888888
 
-        1 => 'Horizontal (normal)',
-        2 => 'Mirror horizontal',
-        3 => 'Rotate 180',
-        4 => 'Mirror vertical',
-        5 => 'Mirror horizontal and rotate 270 CW',
-        6 => 'Rotate 90 CW',
-        7 => 'Mirror horizontal and rotate 90 CW',
-        8 => 'Rotate 270 CW'
-         */
+    1 => 'Horizontal (normal)',
+    2 => 'Mirror horizontal',
+    3 => 'Rotate 180',
+    4 => 'Mirror vertical',
+    5 => 'Mirror horizontal and rotate 270 CW',
+    6 => 'Rotate 90 CW',
+    7 => 'Mirror horizontal and rotate 90 CW',
+    8 => 'Rotate 270 CW'
+     */
 
-        public static int OrientationPos2Deg(int pos)
+    public static int OrientationPos2Deg(int pos) =>
+        pos switch
         {
-            switch(pos)
+            8 => 270,
+            3 => 180,
+            6 => 90,
+            _ => 0
+        };
+
+    public static int OrientationDeg2Pos(int deg) =>
+        deg switch
+        {
+            270 => 8,
+            180 => 3,
+            90 => 6,
+            _ => 1
+        };
+
+    public static int OrientationString2Deg(string pos) =>
+        pos switch
+        {
+            "Rotate 270 CW" => 270,
+            "Rotate 180" => 180,
+            "Rotate 90 CW" => 90,
+            _ => 0
+        };
+
+    public static string OrientationDeg2String(int deg) =>
+        deg switch
+        {
+            270 => "Rotate 270 CW",
+            180 => "Rotate 180",
+            90 => "Rotate 90 CW",
+            _ => "Horizontal (normal)"
+        };
+
+    private static readonly int[] OrientationPositions = [1, 6, 3, 8];
+
+    public static int RotateOrientation(int crtOri, bool clockwise, int steps = 1)
+    {
+        var newOri = 1;
+        var len = OrientationPositions.Length;
+
+        if(steps % len == 0)
+            return crtOri;
+
+        for(var i = 0; i < len; i++)
+        {
+            if(crtOri == OrientationPositions[i])
             {
-                case 8:
-                    return 270;
-                case 3:
-                    return 180;
-                case 6:
-                    return 90;
-                default:
-                    return 0;
+                newOri = clockwise
+                    ? OrientationPositions[(i + steps) % len]
+                    : OrientationPositions[(i + (1 + steps / len) * len - steps) % OrientationPositions.Length];
+
+                break;
             }
         }
 
-        public static int OrientationDeg2Pos(int deg)
-        {
-            switch(deg)
-            {
-                case 270:
-                    return 8;
-                case 180:
-                    return 3;
-                case 90:
-                    return 6;
-                default:
-                    return 1;
-            }
-        }
-
-        public static int OrientationString2Deg(string pos)
-        {
-            switch(pos)
-            {
-                case "Rotate 270 CW":
-                    return 270;
-                case "Rotate 180":
-                    return 180;
-                case "Rotate 90 CW":
-                    return 90;
-                default:
-                    return 0;
-            }
-        }
-
-        public static string OrientationDeg2String(int deg)
-        {
-            switch(deg)
-            {
-                case 270:
-                    return "Rotate 270 CW";
-                case 180:
-                    return "Rotate 180";
-                case 90:
-                    return "Rotate 90 CW";
-                default:
-                    return "Horizontal (normal)";
-            }
-        }
-
-        private static readonly int[] OrientationPositions = { 1, 6, 3, 8 };
-
-        public static int RotateOrientation(int crtOri, bool clockwise, int steps = 1)
-        {
-            int newOri = 1;
-            int len = OrientationPositions.Length;
-
-            if(steps % len == 0)
-                return crtOri;
-
-            for(int i = 0; i < len; i++)
-            {
-                if(crtOri == OrientationPositions[i])
-                {
-                    newOri = clockwise
-                        ? OrientationPositions[(i + steps) % len]
-                        : OrientationPositions[(i + (1 + steps / len) * len - steps) % OrientationPositions.Length];
-
-                    break;
-                }
-            }
-
-            return newOri;
-        }
-
-        #endregion
-        
-        #region IDisposable Members
-
-        public void Dispose()
-        {
-            Debug.Assert(Status == ExeStatus.Ready || Status == ExeStatus.Stopped, "Invalid state");
-
-            if(_proc != null && Status == ExeStatus.Ready)
-                Stop();
-
-            _waitHandle.Dispose();
-        }
-
-        #endregion
+        return newOri;
     }
+
+    #endregion
+        
+    #region IDisposable Members
+
+    public void Dispose()
+    {
+        Debug.Assert(Status is ExeStatus.Ready or ExeStatus.Stopped, "Invalid state");
+
+        if(_proc != null && Status == ExeStatus.Ready)
+            Stop();
+
+        _waitHandle.Dispose();
+        _waitForErrorHandle.Dispose();
+    }
+
+    #endregion
 }

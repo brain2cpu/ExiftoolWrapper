@@ -2,188 +2,146 @@ using System;
 using Brain2CPU.ExifTool;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
-namespace TestProject
+namespace TestProject;
+
+[TestClass]
+public class ExifToolWrapperTests
 {
-    [TestClass]
-    public class ExifToolWrapperTests
+    private const string TestFile = "test.jpg";
+    private const string TestFile2 = "test2.jpg";
+
+    private static ExifToolWrapper _exif;
+
+    [ClassInitialize]
+    public static void ClassInitialize(TestContext testContext)
     {
-        private const string TestFile = "test.jpg";
-        private const string TestFile2 = "test2.jpg";
+        _exif = new ExifToolWrapper();
+        _exif.Start();
+    }
 
-        private ExifToolWrapper _exif;
+    [ClassCleanup]
+    public static void ClassCleanup()
+    {
+        _exif.Stop();
+        _exif.Dispose();
+    }
 
-        [TestInitialize]
-        public void TestInitialize()
-        {
-            _exif = new ExifToolWrapper();
-            _exif.Start();
-        }
+    [TestMethod]
+    public void Start_MissingExifTool_Throws()
+    {
+        Assert.Throws<ExifToolException>(() => new ExifToolWrapper("na"));
+    }
 
-        [TestCleanup]
-        public void TestCleanup()
-        {
-            _exif.Stop();
-            _exif.Dispose();
-        }
+    [TestMethod]
+    public void StartStop_CorrectStatus()
+    {
+        var exif = new ExifToolWrapper();
+        
+        Assert.AreEqual(ExifToolWrapper.ExeStatus.Stopped, exif.Status);
+        
+        exif.Start();
+        
+        Assert.AreEqual(ExifToolWrapper.ExeStatus.Ready, exif.Status);
+        Assert.IsNotEmpty(exif.ExifToolVersion);
+        Assert.Contains("-stay_open True -@", _exif.ArgumentsInUse);
+        
+        exif.Stop();
 
-        [TestMethod]
-        public void Start_ExpectedBehavior()
-        {
-            var exif = new ExifToolWrapper();
-            exif.Start();
+        Assert.AreEqual(ExifToolWrapper.ExeStatus.Stopped, exif.Status);
 
-            Assert.AreEqual(ExifToolWrapper.ExeStatus.Ready, exif.Status);
-            Assert.IsFalse(string.IsNullOrEmpty(exif.ExifToolVersion));
+        exif.Dispose();
+    }
+    
+    [TestMethod]
+    public void FetchExifFrom_ExpectedBehavior()
+    {
+        var v = _exif.FetchExifFrom(TestFile);
+        Assert.AreEqual("100", v["ISO"]);
+        
+        v = _exif.FetchExifFrom(TestFile, ["ISO"]);
+        Assert.ContainsSingle(v);
+        Assert.AreEqual("100", v["ISO"]);
+    }
 
-            exif.Dispose();
-        }
+    [TestMethod]
+    public void FetchExifToListFrom_ExpectedBehavior()
+    {
+        var v = _exif.FetchExifToListFrom(TestFile);
+        Assert.Contains("ISO: 100", v);
+    }
+    
+    [TestMethod]
+    public void GetCreationTime_ExpectedBehavior()
+    {
+        var d = _exif.GetCreationTime(TestFile);
+        Assert.IsTrue(d.HasValue);
+        Assert.AreEqual(new DateTime(2017, 7, 31, 14, 1, 0), d.Value);
+    }
 
-        [TestMethod]
-        [ExpectedException(typeof(ExifToolException))]
-        public void Start_MissingExifTool()
-        {
-            using(var exif = new ExifToolWrapper("na"))
-            { }
-        }
+    [TestMethod]
+    public void WriteOperations_ExpectedBehavior()
+    {
+        // orientation
+        var oKey = "Orientation";
+        var v = _exif.FetchExifFrom(TestFile2, [oKey]);
+        Assert.IsNotEmpty(v);
+        
+        var r = _exif.SetOrientation(TestFile2, 3);
+        Assert.IsTrue(r.IsSuccess);
+        Assert.AreEqual("1 image files updated", r.Result.Trim().Trim('\t', '\r', '\n').ToLowerInvariant());
+        
+        v = _exif.FetchExifFrom(TestFile2, [oKey]);
+        Assert.AreEqual("Rotate 180", v[oKey]);
+        var o = _exif.GetOrientation(TestFile2);
+        Assert.AreEqual(3, o);
+        o = _exif.GetOrientationDeg(TestFile2);
+        Assert.AreEqual(180, o);
+        
+        r = _exif.SetOrientationDeg(TestFile2, 90);
+        Assert.IsTrue(r.IsSuccess);
 
-        [TestMethod]
-        public void Stop_ExpectedBehavior()
-        {
-            var exif = new ExifToolWrapper();
-            exif.Start();
-            exif.Stop();
+        o = _exif.GetOrientationDeg(TestFile2);
+        Assert.AreEqual(90, o);
+        o = _exif.GetOrientation(TestFile2);
+        Assert.AreEqual(6, o);
+        
+        // set exif
+        var key = "Copyright";
+        r = _exif.SetExifInto(TestFile2, key, "BB");
+        Assert.IsTrue(r.IsSuccess);
 
-            Assert.AreEqual(ExifToolWrapper.ExeStatus.Stopped, exif.Status);
+        v = _exif.FetchExifFrom(TestFile2);
+        Assert.AreEqual("BB", v[key]);
 
-            exif.Dispose();
-        }
+        r = _exif.SetExifInto(TestFile2, key, null);
+        Assert.IsTrue(r.IsSuccess);
 
-        [TestMethod]
-        public void SendCommand_ExpectedBehavior()
-        {
-            var r = _exif.SendCommand("-Orientation\n-n\n-s3\n" + TestFile);
+        v = _exif.FetchExifFrom(TestFile2);
+        Assert.IsFalse(v.ContainsKey(key));
+        var keyCount = v.Count;
+        
+        // clear
+        r = _exif.ClearExif(TestFile2);
+        Assert.IsTrue(r.IsSuccess);
 
-            Assert.IsTrue(r.IsSuccess);
-            Assert.AreEqual("1", r.Result.Trim('\t', '\r', '\n'));
-        }
+        v = _exif.FetchExifFrom(TestFile2);
+        Assert.IsFalse(v.ContainsKey(oKey));
+        // some properties are always returned so v is not empty
+        Assert.IsLessThan(keyCount, v.Count);
 
-        [TestMethod]
-        public void SetExifInto_ExpectedBehavior()
-        {
-            var r = _exif.SetExifInto(TestFile, "Copyright", "BB");
-            Assert.IsTrue(r.IsSuccess);
+        // description
+        var descr = "Description with accents ÁÅßéőş";
+        r = _exif.SetDescription(TestFile2, descr);
+        Assert.IsTrue(r.IsSuccess);
+        Assert.AreEqual(descr, _exif.GetDescription(TestFile2));
+        
+        // clone
+        r = _exif.CloneExif(TestFile, TestFile2);
+        Assert.IsTrue(r.IsSuccess);
 
-            var v = _exif.FetchExifFrom(TestFile);
-            Assert.AreEqual("BB", v["Copyright"]);
-        }
-
-        [TestMethod]
-        public void SetExifInto_RemoveKey_ExpectedBehavior()
-        {
-            var r = _exif.SetExifInto(TestFile, "Copyright", "BB");
-            Assert.IsTrue(r.IsSuccess);
-
-            var v = _exif.FetchExifFrom(TestFile);
-            Assert.AreEqual("BB", v["Copyright"]);
-
-            r = _exif.SetExifInto(TestFile, "Copyright", null);
-            Assert.IsTrue(r.IsSuccess);
-
-            v = _exif.FetchExifFrom(TestFile);
-            Assert.IsFalse(v.ContainsKey("Copyright"));
-        }
-
-        [TestMethod]
-        public void FetchExifFrom_ExpectedBehavior()
-        {
-            var v = _exif.FetchExifFrom(TestFile);
-            Assert.AreEqual("100", v["ISO"]);
-        }
-
-        [TestMethod]
-        public void FetchExifToListFrom_ExpectedBehavior()
-        {
-            var v = _exif.FetchExifToListFrom(TestFile);
-            Assert.IsTrue(v.Contains("ISO: 100"));
-        }
-
-        [TestMethod]
-        public void CloneExif_ExpectedBehavior()
-        {
-            _exif.SetExifInto(TestFile, "Copyright", "NA");
-
-            var r = _exif.CloneExif(TestFile, TestFile2);
-            Assert.IsTrue(r.IsSuccess);
-
-            var v = _exif.FetchExifFrom(TestFile2);
-            Assert.AreEqual("NA", v["Copyright"]);
-        }
-
-        [TestMethod]
-        public void ClearExif_ExpectedBehavior()
-        {
-            var r = _exif.ClearExif(TestFile2);
-            Assert.IsTrue(r.IsSuccess);
-
-            var v = _exif.FetchExifFrom(TestFile2);
-            Assert.IsFalse(v.ContainsKey("Copyright"));
-        }
-
-        [TestMethod]
-        public void GetCreationTime_ExpectedBehavior()
-        {
-            var d = _exif.GetCreationTime(TestFile);
-            Assert.IsTrue(d.HasValue);
-            Assert.AreEqual(new DateTime(2017, 7, 31, 14, 1, 0), d.Value);
-        }
-
-        [TestMethod]
-        public void GetOrientation_ExpectedBehavior()
-        {
-            var o = _exif.GetOrientation(TestFile);
-            Assert.AreEqual(1, o);
-        }
-
-        [TestMethod]
-        public void GetOrientationDeg_ExpectedBehavior()
-        {
-            var o = _exif.GetOrientationDeg(TestFile);
-            Assert.AreEqual(0, o);
-        }
-
-        [TestMethod]
-        public void SetOrientation_ExpectedBehavior()
-        {
-            var r = _exif.SetOrientation(TestFile2, 2);
-            Assert.IsTrue(r.IsSuccess);
-
-            var o = _exif.GetOrientation(TestFile2);
-            Assert.AreEqual(2, o);
-        }
-
-        [TestMethod]
-        public void SetOrientationDeg_ExpectedBehavior()
-        {
-            var r = _exif.SetOrientationDeg(TestFile2, 270);
-            Assert.IsTrue(r.IsSuccess);
-
-            var o = _exif.GetOrientationDeg(TestFile2);
-            Assert.AreEqual(270, o);
-        }
-
-        [TestMethod]
-        public void TypicalUsage_ExpectedBehavior()
-        {
-            using(var exif = new ExifToolWrapper())
-            {
-                exif.Start();
-
-                var o = _exif.GetOrientation(TestFile);
-                Assert.AreEqual(1, o);
-
-                var v = _exif.FetchExifFrom(TestFile);
-                Assert.IsTrue(v.Count > 0);
-            }
-        }
+        var expected = _exif.FetchExifFrom(TestFile, [key]);
+        v = _exif.FetchExifFrom(TestFile2);
+        Assert.AreEqual(expected[key], v[key]);
+        Assert.IsTrue(v.ContainsKey(oKey));
     }
 }
