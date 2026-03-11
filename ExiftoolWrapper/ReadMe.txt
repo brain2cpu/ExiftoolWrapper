@@ -6,6 +6,7 @@ https://sno.phy.queensu.ca/~phil/exiftool/
 Do not forget to add 
 exiftool(-k).exe
 to your project output folder or specify the full path in the constructor!
+Use exiftool version 13 or later!
 
 A simple example:
 

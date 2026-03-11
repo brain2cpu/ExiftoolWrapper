@@ -6,16 +6,17 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace Brain2CPU.ExifTool;
 
-public sealed class ExifToolWrapper : IExifToolWrapper
+public sealed partial class ExifToolWrapper : IExifToolWrapper
 {
     //-fast2 also causes exiftool to avoid extracting any EXIF MakerNote information
     private  const string ExeName         = "exiftool(-k).exe";
-    private  const string Arguments       = "-fast  -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";   //-g for groups
-    private  const string ArgumentsFaster = "-fast2 -m -q -q -stay_open True -@ - -common_args -d \"%Y.%m.%d %H:%M:%S\" -c \"%d %d %.6f\" -t -charset utf8";
+    private  const string Arguments       = "-fast  -m -q -q -stay_open True -@ - -common_args -c \"%d %d %.6f\" -t -charset utf8";   //-g for groups
+    private  const string ArgumentsFaster = "-fast2 -m -q -q -stay_open True -@ - -common_args -c \"%d %d %.6f\" -t -charset utf8";
     private  const string ExitMessage     = "-- press RETURN --";
     internal const string SuccessMessage  = "1 image files updated";
 
@@ -149,8 +150,10 @@ public sealed class ExifToolWrapper : IExifToolWrapper
 
         if(Status == ExeStatus.Starting)
         {
-            ExifToolVersion = e.Data;
-            _waitHandle.Set();
+            if (string.Equals(e.Data, "{ready0000}", StringComparison.OrdinalIgnoreCase))
+                _waitHandle.Set();
+            else
+                ExifToolVersion = e.Data;
 
             return;
         }
@@ -162,7 +165,7 @@ public sealed class ExifToolWrapper : IExifToolWrapper
             return;
         }
 
-        _output.AppendLine(e.Data);
+        _output.AppendLine(FormatDateTime(e.Data));
     }
 
     //the error message has no 'ready' or other terminator so we must assume it has a single line (or it is received fast enough)
@@ -198,6 +201,17 @@ public sealed class ExifToolWrapper : IExifToolWrapper
         if(!_stopRequested && Resurrect)
             Start();
     }
+
+#if NET8_0_OR_GREATER
+    [GeneratedRegex(@"\b(\d{4}):(\d{2}):(\d{2})\b(?=\s+\d{2}:\d{2}:\d{2})")]
+    private partial Regex DateTimeRegex();
+
+    private string FormatDateTime(string s) => DateTimeRegex().Replace(s, "$1.$2.$3");
+#else
+    private readonly Regex _dateTimeRegex = new(@"\b(\d{4}):(\d{2}):(\d{2})\b(?=\s+\d{2}:\d{2}:\d{2})", RegexOptions.Compiled);
+
+    private string FormatDateTime(string s) => _dateTimeRegex.Replace(s, "$1.$2.$3");
+#endif
 
     public void Stop()
     {
@@ -353,9 +367,9 @@ public sealed class ExifToolWrapper : IExifToolWrapper
         if(!File.Exists(path))
             yield break;
 
-#if NETSTANDARD2_0        
+#if NETSTANDARD2_0
         var tagsTable = tagsToKeep == null ? null : new HashSet<string>(tagsToKeep);
-#else        
+#else
         var tagsTable = tagsToKeep?.ToHashSet();
 #endif
         
