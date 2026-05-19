@@ -21,6 +21,7 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
     internal const string SuccessMessage  = "1 image files updated";
 
     public double SecondsToWaitForError { get; set; } = 1;
+    public double SecondsToWaitForStart  { get; set; } = 10;
     public double SecondsToWaitForStop  { get; set; } = 5;
 
     public string ExifToolPath    { get; }
@@ -28,7 +29,9 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
     public string ExifToolVersion { get; private set; }
     
     public enum ExeStatus { Stopped, Starting, Ready, Stopping }
-    public ExeStatus Status { get; private set; }
+
+    private volatile ExeStatus _status;
+    public ExeStatus Status => _status;
 
     //ViaFile: for every command an argument file is created, it works for files with accented characters, but it is slower
     public enum CommunicationMethod { Auto, Direct, ViaFile }
@@ -36,7 +39,8 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
 
     public bool Resurrect { get; set; } = true;
 
-    private bool _stopRequested = false;
+    private volatile bool _stopRequested = false;
+    private volatile bool _disposed = false;
 
     private int _cmdCnt = 0;
     private readonly StringBuilder _output = new();
@@ -79,7 +83,7 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
             StandardErrorEncoding = Encoding.UTF8
         };
 
-        Status = ExeStatus.Stopped;
+        _status = ExeStatus.Stopped;
     }
 
     private static string DiscoverExiftool(string path)
@@ -121,10 +125,13 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
     {
         _stopRequested = false;
 
-        if(Status != ExeStatus.Stopped)
+        if(_disposed)
+            throw new ExifToolException($"{nameof(ExifToolWrapper)} is already disposed");
+
+        if(_status != ExeStatus.Stopped)
             throw new ExifToolException("Process is not stopped");
 
-        Status = ExeStatus.Starting;
+        _status = ExeStatus.Starting;
 
         _proc = new Process { StartInfo = _psi, EnableRaisingEvents = true };
         _proc.OutputDataReceived += OutputDataReceived;
@@ -138,9 +145,12 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
 
         _waitHandle.Reset();
         _proc.StandardInput.Write("-ver\n-execute0000\n");
-        _waitHandle.WaitOne();
+        if(!_waitHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForStart)))
+        {
+            throw new ExifToolException("Process did not start in the expected time");
+        }
 
-        Status = ExeStatus.Ready;
+        _status = ExeStatus.Ready;
     }
 
     private void OutputDataReceived(object sender, DataReceivedEventArgs e)
@@ -148,7 +158,7 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
         if(string.IsNullOrEmpty(e?.Data))
             return;
 
-        if(Status == ExeStatus.Starting)
+        if(_status == ExeStatus.Starting)
         {
             if (string.Equals(e.Data, "{ready0000}", StringComparison.OrdinalIgnoreCase))
                 _waitHandle.Set();
@@ -194,9 +204,19 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
             _proc = null;
         }
 
-        Status = ExeStatus.Stopped;
+        _status = ExeStatus.Stopped;
 
-        _waitHandle.Set();
+        if(_disposed)
+            return;
+
+        try
+        {
+            _waitHandle.Set();
+        }
+        catch(ObjectDisposedException)
+        {
+            return;
+        }
 
         if(!_stopRequested && Resurrect)
             Start();
@@ -217,17 +237,24 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
     {
         _stopRequested = true;
 
-        if(Status != ExeStatus.Ready)
+        if(_status != ExeStatus.Ready)
             throw new ExifToolException("Process must be ready");
 
-        Status = ExeStatus.Stopping;
+        _status = ExeStatus.Stopping;
 
         _waitHandle.Reset();
-        _proc.StandardInput.Write("-stay_open\nFalse\n");
-            
-        if(!_waitHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForStop)))
+
+        if(_proc != null)
+            _proc.StandardInput.Write("-stay_open\nFalse\n");
+        else
         {
-            if(_proc != null)
+            Debug.WriteLine("Process is null");
+            return;
+        }
+
+        if (!_waitHandle.WaitOne(TimeSpan.FromSeconds(SecondsToWaitForStop)))
+        {
+            if (_proc != null)
             {
                 try
                 {
@@ -237,7 +264,7 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
                     // after WaitForExit proc turns null
                     _proc?.Dispose();
                 }
-                catch(Exception xcp)
+                catch (Exception xcp)
                 {
                     Debug.WriteLine(xcp.ToString());
                 }
@@ -245,7 +272,7 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
                 _proc = null;
             }
 
-            Status = ExeStatus.Stopped;
+            _status = ExeStatus.Stopped;
         }
     }
 
@@ -277,7 +304,7 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
         
     private ExifToolResponse SendCommand(CommunicationMethod method, string cmd, params object[] args)
     {
-        if(Status != ExeStatus.Ready)
+        if(_status != ExeStatus.Ready)
             throw new ExifToolException("Process must be ready");
 
         ExifToolResponse resp;
@@ -474,12 +501,12 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
         if (!File.Exists(path))
             return new ExifToolResponse(false, $"'{path}' not found");
 
-        var prevMethod = Method;
-        Method = CommunicationMethod.ViaFile;
-        var res = SetExifInto(path, "XMP-dc:Description", description, overwriteOriginal);
-        Method = prevMethod;
+        var cmd = $"-XMP-dc:Description={description}\n";
+        if (overwriteOriginal)
+            cmd += "-overwrite_original\n";
 
-        return res;
+        var cmdRes = SendCommand(CommunicationMethod.ViaFile, $"{cmd}{path}");
+        return cmdRes ? new ExifToolResponse(cmdRes.Result) : cmdRes;
     }
 
     public string GetDescription(string path)
@@ -492,9 +519,6 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
             return "";
 
         return cmdRes.Result.Trim('\t', '\r', '\n');
-
-        //var cmdRes = FetchExifFrom(path, { "XMP-dc:Description"});
-        //return cmdRes.SingleOrDefault().Value ?? "";
     }
 
     #region Static orientation helpers
@@ -586,10 +610,22 @@ public sealed partial class ExifToolWrapper : IExifToolWrapper
 
     public void Dispose()
     {
-        Debug.Assert(Status is ExeStatus.Ready or ExeStatus.Stopped, "Invalid state");
+        if(_disposed)
+            return;
 
-        if(_proc != null && Status == ExeStatus.Ready)
-            Stop();
+        _disposed = true;
+
+        Debug.Assert(_status is ExeStatus.Ready or ExeStatus.Stopped, "Invalid state");
+
+        try
+        {
+            if(_proc != null && _status == ExeStatus.Ready)
+                Stop();
+        }
+        catch(Exception xcp)
+        {
+            Debug.WriteLine(xcp.ToString());
+        }
 
         _waitHandle.Dispose();
         _waitForErrorHandle.Dispose();

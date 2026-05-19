@@ -5,7 +5,7 @@
     <SignAssembly>true</SignAssembly>
     <AssemblyOriginatorKeyFile>Brain2CPU.ExifTool.snk</AssemblyOriginatorKeyFile>
     <DelaySign>false</DelaySign>
-    <Version>5.1.0</Version>
+    <Version>5.2.0</Version>
     <Authors>Béla Bokor</Authors>
     <Company>Brain2CPU</Company>
     <Description>A .NET dll wrapper over exiftool</Description>

@@ -6,6 +6,7 @@ namespace Brain2CPU.ExifTool;
 public interface IExifToolWrapper : IDisposable
 {
     double SecondsToWaitForError { get; set; }
+    double SecondsToWaitForStart { get; set; }
     double SecondsToWaitForStop { get; set; }
     string ExifToolPath { get; }
     string ExifToolVersion { get; }
